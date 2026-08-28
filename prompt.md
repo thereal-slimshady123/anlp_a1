@@ -10,8 +10,11 @@ Strict Rules:
 
 ## Plan of Action (Step-by-Step Execution)
 
+- Note : 	
+For C1–C4, the ciphertext must use a learned subword tokenization scheme (e.g. BPE/SentencePiece-style tokenization). Fixed-width chunking (such as 8 bits = 1 token) does not count as subword tokenization.
+
 ### Step 1: Repository & Environment Setup
-1. Create the following directory structure:
+1. Create the following directory structure if it's not already there:
    `<rollnumber>_assignment1/`
    ├── `src/`
    │   ├── `models/`
@@ -20,8 +23,8 @@ Strict Rules:
    │   │   ├── `norm.py`          # LayerNorm, RMSNorm
    │   │   └── `blt.py`           # Local Encoder/Decoder patch modules for BLT
    │   ├── `dataset.py`           # Tokenized & Byte-level DataLoaders
-   │   ├── `train.py`             # Training loop, WandB integration, HF checkpointing
-   │   └── `utils.py`             # Metrics: Bit-Level Acc, Seq Acc, Levenshtein, BLEU, ROUGE
+   │   ├── `train.py`             # Training loop, WandB integration, HF checkpointing (it's not an actual folder, just demarcating that this section is for checkpointing)
+   │   └── `utils.py`             # Metrics: Bit-Level Acc, Seq Acc, Levenshtein, BLEU, ROUGE (same, not an actual folder, just demarcation)
    ├── `outputs/`
    ├── `README.md`
    └── `Report.pdf`
@@ -69,4 +72,4 @@ Assemble the baseline and ablation variants into a configurable model wrapper:
 ---
 
 ## Instructions for AI Assistant
-When I ask you to work on a step, provide full, clean, well-commented PyTorch code for the relevant file. Always verify module tensor shapes (`batch_size`, `seq_len`, `d_model`) before completing a task.
+When I ask you to work on a step, provide full, clean, well-commented PyTorch code for the relevant file. Always verify module tensor shapes (`batch_size`, `seq_len`, `d_model`) before completing a task. Also, after implementing something ask me a question regarding it so that I can actually learn the concepts.
