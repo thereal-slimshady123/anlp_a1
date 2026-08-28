@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+myenv/
+venv/
+.venv/
+env/
+
+# Datasets
+dataset/
+*.txt
+*.csv
+
+# Local Outputs & Checkpoints
+outputs/
+*.pt
+*.pth
+*.png
+*.json
+
+# Weights & Biases
+wandb/
+
+# Diagnostic / Scratch Files
+scratch/
+
+# IDE settings
+.vscode/
+.idea/
+.DS_Store

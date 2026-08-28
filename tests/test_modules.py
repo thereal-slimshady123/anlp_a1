@@ -310,5 +310,108 @@ class TestBLTModules(unittest.TestCase):
         self.assertIsNotNone(decoder.lm_head.weight.grad)
 
 
+class TestSeq2SeqTransformer(unittest.TestCase):
+    def setUp(self):
+        self.batch_size = 2
+        self.src_len = 16
+        self.tgt_len = 12
+        self.src_vocab_size = 100
+        self.tgt_vocab_size = 150
+        self.d_model = 64
+        self.num_heads = 4
+        self.num_encoder_layers = 2
+        self.num_decoder_layers = 2
+        self.d_ff = 128
+
+    def _test_config_forward_backward(self, config_name: str, src_vocab: int, tgt_vocab: int):
+        from src.models.transformer import Seq2SeqTransformer
+        
+        model = Seq2SeqTransformer.from_config_name(
+            config_name=config_name,
+            src_vocab_size=src_vocab,
+            tgt_vocab_size=tgt_vocab,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            num_encoder_layers=self.num_encoder_layers,
+            num_decoder_layers=self.num_decoder_layers,
+            d_ff=self.d_ff
+        )
+        
+        src = torch.randint(1, src_vocab, (self.batch_size, self.src_len))
+        tgt = torch.randint(1, tgt_vocab, (self.batch_size, self.tgt_len))
+        
+        src_mask = torch.ones(self.batch_size, self.src_len, dtype=torch.bool)
+        
+        # Causal mask: lower triangular boolean mask (batch, 1, tgt_len, tgt_len)
+        causal_mask = torch.tril(torch.ones(self.tgt_len, self.tgt_len, dtype=torch.bool)).unsqueeze(0).unsqueeze(0)
+        
+        logits = model(src, tgt, src_mask=src_mask, tgt_mask=causal_mask)
+        
+        self.assertEqual(logits.shape, (self.batch_size, self.tgt_len, tgt_vocab))
+        
+        loss = logits.sum()
+        loss.backward()
+        
+        # Check that gradients were calculated for parameters
+        has_grads = any(p.grad is not None for p in model.parameters() if p.requires_grad)
+        self.assertTrue(has_grads)
+
+    def test_c1_base(self):
+        self._test_config_forward_backward('C1', self.src_vocab_size, self.tgt_vocab_size)
+
+    def test_c2_rope(self):
+        self._test_config_forward_backward('C2', self.src_vocab_size, self.tgt_vocab_size)
+
+    def test_c3_gqa(self):
+        self._test_config_forward_backward('C3', self.src_vocab_size, self.tgt_vocab_size)
+
+    def test_c4_rmsnorm(self):
+        self._test_config_forward_backward('C4', self.src_vocab_size, self.tgt_vocab_size)
+
+    def test_c5_blt(self):
+        self._test_config_forward_backward('C5', 260, 260)
+
+
+class TestBPETokenizerFromScratch(unittest.TestCase):
+    def test_bpe_training_encode_decode(self):
+        from src.dataset import BPETokenizer
+        
+        sample_corpus = [
+            "the cat sat on the mat",
+            "the dog sat on the rug",
+            "the cat chased the dog"
+        ]
+        
+        tokenizer = BPETokenizer()
+        tokenizer.train(sample_corpus, vocab_size=30, min_frequency=1, is_binary=False)
+        
+        self.assertGreater(tokenizer.get_vocab_size(), 4)
+        
+        enc = tokenizer.encode("the cat sat", is_binary=False)
+        self.assertTrue(len(enc.ids) > 0)
+        self.assertNotIn(tokenizer.unk_id, enc.ids)
+        
+        decoded = tokenizer.decode(enc.ids)
+        self.assertEqual(decoded, "the cat sat")
+
+    def test_bpe_binary_merges(self):
+        from src.dataset import BPETokenizer
+        
+        binary_corpus = [
+            "00010011000100110001",
+            "00010011000100111111"
+        ]
+        
+        tokenizer = BPETokenizer()
+        tokenizer.train(binary_corpus, vocab_size=20, min_frequency=1, is_binary=True)
+        
+        enc = tokenizer.encode("00010011", is_binary=True)
+        # Should merge '0001' and '0011' into subwords
+        self.assertLess(len(enc.ids), 8)
+        
+        decoded = tokenizer.decode(enc.ids)
+        self.assertEqual(decoded, "00010011")
+
+
 if __name__ == '__main__':
     unittest.main()
