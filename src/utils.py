@@ -56,12 +56,18 @@ def compute_bit_accuracy(preds: List[str], targets: List[str]) -> float:
 def compute_sequence_accuracy(preds: List[str], targets: List[str]) -> float:
     """
     Computes Exact Match Sequence Accuracy.
-    Returns fraction of samples where prediction exactly matches target.
+    Returns fraction of samples where prediction exactly matches target (whitespace-invariant).
     """
     if not preds or not targets:
         return 0.0
         
-    exact_matches = sum(1 for p, t in zip(preds, targets) if p.strip() == t.strip())
+    exact_matches = 0
+    for p, t in zip(preds, targets):
+        p_words = p.strip().split()
+        t_words = t.strip().split()
+        if p_words and t_words and p_words == t_words:
+            exact_matches += 1
+            
     return exact_matches / len(preds)
 
 

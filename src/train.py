@@ -525,8 +525,8 @@ def main():
     # Model Architecture Hyperparameters
     parser.add_argument("--d_model", type=int, default=256, help="Transformer hidden dimension")
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--num_encoder_layers", type=int, default=3, help="Number of encoder layers")
-    parser.add_argument("--num_decoder_layers", type=int, default=3, help="Number of decoder layers")
+    parser.add_argument("--num_encoder_layers", type=int, default=4, help="Number of encoder layers")
+    parser.add_argument("--num_decoder_layers", type=int, default=4, help="Number of decoder layers")
     parser.add_argument("--d_ff", type=int, default=512, help="FeedForward inner dimension")
     parser.add_argument("--num_kv_heads", type=int, default=None, help="Number of KV heads for GQA (C3)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")

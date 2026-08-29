@@ -28,6 +28,35 @@ UNK_ID = 3
 
 
 
+def binary_to_byte_string(binary_str: str) -> str:
+    """
+    Groups every 8 bits of a binary string ('0'/'1') into a single byte character.
+    Maps byte values (0-255) to clean Unicode CJK characters starting at 0x4E00
+    to avoid whitespace/punctuation splitting in standard BPE tokenizer.
+    """
+    remainder = len(binary_str) % 8
+    if remainder != 0:
+        binary_str = binary_str + "0" * (8 - remainder)
+        
+    chars = []
+    for i in range(0, len(binary_str), 8):
+        byte_val = int(binary_str[i:i+8], 2)
+        chars.append(chr(0x4E00 + byte_val))
+    return "".join(chars)
+
+
+def byte_string_to_binary(byte_str: str) -> str:
+    """
+    Converts CJK byte-grouped characters back into standard 8-bit binary strings.
+    """
+    bits = []
+    for c in byte_str:
+        byte_val = ord(c) - 0x4E00
+        if 0 <= byte_val <= 255:
+            bits.append(f"{byte_val:08b}")
+    return "".join(bits)
+
+
 class BPETokenizer:
     """
     Pure Python Subword Tokenizer implementing the Byte-Pair Encoding (BPE) algorithm from scratch.
@@ -114,13 +143,20 @@ class BPETokenizer:
         word_counts = collections.defaultdict(int)
         base_chars: Set[str] = set()
 
-        sample_corpus = corpus[:1000] if (is_binary and len(corpus) > 1000) else corpus
+        is_cjk = len(corpus) > 0 and len(corpus[0]) > 0 and ord(corpus[0][0]) >= 0x4E00
+        sample_corpus = corpus[:1000] if ((is_binary or is_cjk) and len(corpus) > 1000) else corpus
 
         for line in sample_corpus:
             line = line.strip()
             if not line:
                 continue
-            if is_binary:
+            if len(line) > 0 and ord(line[0]) >= 0x4E00:
+                # Chunk CJK string into 8-character windows (8 bytes = 64 bits)
+                for j in range(0, len(line), 8):
+                    chunk = line[j:j+8]
+                    word_counts[chunk] += 1
+                    base_chars.update(chunk)
+            elif is_binary:
                 # Chunk binary stream into 32-char windows so BPE discovers variable-length bit subwords
                 for j in range(0, len(line), 32):
                     chunk = line[j:j+32]
@@ -254,7 +290,12 @@ class BPETokenizer:
         text = text.strip()
         tokens = []
         
-        if is_binary:
+        if len(text) > 0 and ord(text[0]) >= 0x4E00:
+            # Chunk CJK string into 8-character windows (8 bytes = 64 bits)
+            for j in range(0, len(text), 8):
+                chunk = text[j:j+8]
+                tokens.extend(self._bpe_word(chunk))
+        elif is_binary:
             # Chunk binary stream into 32-char windows and apply BPE
             for j in range(0, len(text), 32):
                 chunk = text[j:j+32]
@@ -341,9 +382,12 @@ class ByteTokenizer:
         self.vocab_size = 260
 
     def encode(self, text: str, is_binary: bool = False) -> Any:
-        raw_bytes = text.strip().encode('utf-8')
-        ids = [b + 4 for b in raw_bytes]
-        
+        if len(text) > 0 and ord(text[0]) >= 0x4E00 and ord(text[0]) < 0x4E00 + 256:
+            ids = [ord(c) - 0x4E00 + 4 for c in text]
+        else:
+            raw_bytes = text.strip().encode('utf-8')
+            ids = [b + 4 for b in raw_bytes]
+            
         class Encoding:
             def __init__(self, ids):
                 self.ids = ids
@@ -382,7 +426,8 @@ def get_or_train_tokenizers(
         with open(cipher_file, 'r', encoding='utf-8') as f:
             cipher_lines = [line.strip() for line in f if line.strip()]
         cipher_tokenizer = BPETokenizer()
-        cipher_tokenizer.train(cipher_lines, vocab_size=cipher_vocab_size, is_binary=True)
+        cipher_lines_grouped = [binary_to_byte_string(line) for line in cipher_lines]
+        cipher_tokenizer.train(cipher_lines_grouped, vocab_size=cipher_vocab_size, is_binary=False)
         cipher_tokenizer.save(cipher_tok_path)
         
     try:
@@ -419,8 +464,11 @@ class CipherPlainDataset(Dataset):
             c_text = c_line.strip()
             p_text = p_line.strip()
             
+            # Group ciphertext bits into CJK byte string
+            c_text_grouped = binary_to_byte_string(c_text)
+            
             # Tokenize with from-scratch BPE
-            src_ids = cipher_tokenizer.encode(c_text, is_binary=True).ids
+            src_ids = cipher_tokenizer.encode(c_text_grouped, is_binary=False).ids
             tgt_ids = plain_tokenizer.encode(p_text, is_binary=False).ids
             
             # Add <sos> and <eos> tokens
@@ -451,8 +499,8 @@ class BLTByteDataset(Dataset):
         cipher_lines: List[str],
         plain_lines: List[str],
         byte_tokenizer: ByteTokenizer,
-        max_src_len: int = 2048,
-        max_tgt_len: int = 1024
+        max_src_len: int = 512,
+        max_tgt_len: int = 512
     ):
         assert len(cipher_lines) == len(plain_lines), "Line count mismatch between cipher and plain files"
         self.samples = []
@@ -461,7 +509,8 @@ class BLTByteDataset(Dataset):
             c_text = c_line.strip()
             p_text = p_line.strip()
             
-            src_ids = byte_tokenizer.encode(c_text, is_binary=True).ids
+            c_text_grouped = binary_to_byte_string(c_text)
+            src_ids = byte_tokenizer.encode(c_text_grouped, is_binary=False).ids
             tgt_ids = byte_tokenizer.encode(p_text, is_binary=False).ids
             
             src_ids = [SOS_ID] + src_ids[:max_src_len - 2] + [EOS_ID]
