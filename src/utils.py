@@ -296,7 +296,7 @@ def evaluate_dataset(
             if criterion is not None:
                 logits = model(src=src, tgt=tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
                 vocab_size = logits.size(-1)
-                loss = criterion(logits.view(-1, vocab_size), tgt_out.contiguous().view(-1))
+                loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
                 non_pad_tokens = (tgt_out != PAD_ID).sum().item()
                 val_loss += loss.item() * non_pad_tokens
                 val_tokens += non_pad_tokens

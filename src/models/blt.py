@@ -108,7 +108,7 @@ class ByteLocalEncoder(nn.Module):
         conv_out = self.conv_norm(F.gelu(conv_out) + byte_emb)
         
         # 3. Reshape into non-overlapping patches: (batch, num_patches, patch_size * d_byte)
-        patches_flat = conv_out.view(batch_size, num_patches, self.patch_size * self.d_byte)
+        patches_flat = conv_out.reshape(batch_size, num_patches, self.patch_size * self.d_byte)
         
         # 4. Project patches to global Transformer dimension d_model: (batch, num_patches, d_model)
         patch_embeds = self.norm(self.patch_proj(patches_flat))
@@ -211,4 +211,4 @@ class ByteLocalDecoder(nn.Module):
         if target_byte_len is not None and logits.size(1) > target_byte_len:
             logits = logits[:, :target_byte_len, :]
             
-        return logits
+        return logits.contiguous()

@@ -120,7 +120,7 @@ def train_one_epoch(
             with torch.amp.autocast('cuda'):
                 logits = model(src=src, tgt=tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
                 vocab_size = logits.size(-1)
-                loss = criterion(logits.view(-1, vocab_size), tgt_out.contiguous().view(-1))
+                loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -130,7 +130,7 @@ def train_one_epoch(
         else:
             logits = model(src=src, tgt=tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
             vocab_size = logits.size(-1)
-            loss = criterion(logits.view(-1, vocab_size), tgt_out.contiguous().view(-1))
+            loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -361,8 +361,7 @@ def run_training(args):
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay)
     
-    total_training_steps = len(train_loader) * args.epochs
-    scheduler = get_lr_scheduler(optimizer, warmup_steps=args.warmup_steps, total_steps=total_training_steps)
+    scheduler = None  # Fixed learning rate at 5e-4 (no warmup or decay)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     # 5. Training and Evaluation Loop
@@ -538,7 +537,7 @@ def main():
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size per step")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Fixed learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay")
     parser.add_argument("--warmup_steps", type=int, default=50, help="Linear warmup steps")
     parser.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing epsilon")
@@ -547,7 +546,7 @@ def main():
     
     # Vocab sizes
     parser.add_argument("--cipher_vocab_size", type=int, default=1000, help="BPE vocab size for ciphertext")
-    parser.add_argument("--plain_vocab_size", type=int, default=4000, help="BPE vocab size for English plaintext")
+    parser.add_argument("--plain_vocab_size", type=int, default=1000, help="BPE vocab size for English plaintext")
     
     # Evaluation & Hardware
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes (0 recommended on Windows with in-memory datasets)")
