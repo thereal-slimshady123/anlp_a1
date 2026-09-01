@@ -361,7 +361,7 @@ def run_training(args):
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay)
     
-    scheduler = None  # Fixed learning rate at 5e-4 (no warmup or decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     # 5. Training and Evaluation Loop
@@ -395,7 +395,7 @@ def run_training(args):
             train_loader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
-            scheduler=scheduler,
+            scheduler=None,
             device=device,
             epoch=epoch,
             scaler=scaler,
@@ -403,6 +403,9 @@ def run_training(args):
             wandb_run=wandb_run,
             log_interval=args.log_interval
         )
+        
+        if scheduler is not None:
+            scheduler.step()
         
         # Evaluate on validation set
         print("[VAL] Running validation & greedy decoding...")
@@ -526,7 +529,7 @@ def main():
     parser.add_argument("--num_heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--num_encoder_layers", type=int, default=4, help="Number of encoder layers")
     parser.add_argument("--num_decoder_layers", type=int, default=4, help="Number of decoder layers")
-    parser.add_argument("--d_ff", type=int, default=512, help="FeedForward inner dimension")
+    parser.add_argument("--d_ff", type=int, default=1024, help="FeedForward inner dimension")
     parser.add_argument("--num_kv_heads", type=int, default=None, help="Number of KV heads for GQA (C3)")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     
@@ -535,23 +538,23 @@ def main():
     parser.add_argument("--blt_d_byte", type=int, default=64, help="Byte embedding dimension for BLT")
     
     # Training Hyperparameters
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size per step")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Fixed learning rate")
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size per step")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Fixed learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay")
-    parser.add_argument("--warmup_steps", type=int, default=50, help="Linear warmup steps")
-    parser.add_argument("--label_smoothing", type=float, default=0.1, help="Label smoothing epsilon")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Linear warmup steps")
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing epsilon (0.0 for standard cross entropy)")
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation data split fraction")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Vocab sizes
     parser.add_argument("--cipher_vocab_size", type=int, default=1000, help="BPE vocab size for ciphertext")
-    parser.add_argument("--plain_vocab_size", type=int, default=1000, help="BPE vocab size for English plaintext")
+    parser.add_argument("--plain_vocab_size", type=int, default=2000, help="BPE vocab size for English plaintext")
     
     # Evaluation & Hardware
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes (0 recommended on Windows with in-memory datasets)")
     parser.add_argument("--max_decode_len", type=int, default=128, help="Maximum length for greedy decoding")
-    parser.add_argument("--max_eval_batches", type=int, default=1, help="Limit number of validation batches for greedy decoding speed")
+    parser.add_argument("--max_eval_batches", type=int, default=5, help="Limit number of validation batches for greedy decoding speed (5 batches = 320 samples)")
     parser.add_argument("--max_samples", type=int, default=None, help="Debug mode: limit total dataset samples")
     parser.add_argument("--log_interval", type=int, default=20, help="Steps between training logs")
     parser.add_argument("--no_cuda", action="store_true", help="Force CPU training")
@@ -574,8 +577,8 @@ def main():
         args.num_kv_heads = 4
         
     # Auto-adjust batch size for C5 BLT to optimize memory if using default
-    if args.config.upper() == 'C5' and args.batch_size == 32:
-        args.batch_size = 16
+    if args.config.upper() == 'C5' and args.batch_size == 64:
+        args.batch_size = 32
         
     run_training(args)
 

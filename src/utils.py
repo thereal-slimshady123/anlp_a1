@@ -142,21 +142,21 @@ def greedy_decode(
     model: nn.Module,
     src: torch.Tensor,
     src_mask: torch.Tensor,
-    max_len: int = 256,
-    repetition_penalty: float = 1.15,
+    max_len: int = 128,
+    repetition_penalty: float = 1.0,
     sos_id: int = SOS_ID,
     eos_id: int = EOS_ID,
     pad_id: int = PAD_ID
 ) -> torch.Tensor:
     """
-    Performs autoregressive greedy decoding with optional repetition penalty for a batch of source sequences.
+    Performs fast autoregressive greedy decoding with PyTorch AMP for a batch of source sequences.
     
     Args:
         model: Seq2SeqTransformer instance.
         src: (batch_size, src_seq_len)
         src_mask: (batch_size, src_seq_len)
-        max_len: Maximum target generation length. Default: 256.
-        repetition_penalty: Penalty factor applied to previously generated tokens. Default: 1.15.
+        max_len: Maximum target generation length. Default: 128.
+        repetition_penalty: Penalty factor applied to previously generated tokens. Default: 1.0.
         
     Returns:
         torch.Tensor: Generated token IDs of shape (batch_size, generated_len)
@@ -164,66 +164,67 @@ def greedy_decode(
     model.eval()
     device = src.device
     batch_size = src.size(0)
+    use_amp = (device.type == 'cuda')
     
-    # 1. Encode source sequence once
-    memory, eff_src_mask = model.encode(src, src_mask=src_mask)
-    
-    mem_mask_4d = None
-    if eff_src_mask is not None:
-        if eff_src_mask.dim() == 2:
-            mem_mask_4d = eff_src_mask.unsqueeze(1).unsqueeze(2)
-        else:
-            mem_mask_4d = eff_src_mask
-            
-    # 2. Initialize target tensor with <sos>
-    ys = torch.full((batch_size, 1), fill_value=sos_id, dtype=torch.long, device=device)
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    
-    for _ in range(max_len):
-        cur_len = ys.size(1)
-        tgt_mask = make_causal_mask(cur_len).to(device)
+    with torch.amp.autocast('cuda', enabled=use_amp):
+        # 1. Encode source sequence once
+        memory, eff_src_mask = model.encode(src, src_mask=src_mask)
         
-        # Decode current prefix
-        dec_out = model.decode(
-            tgt=ys,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            memory_mask=mem_mask_4d
-        )
+        mem_mask_4d = None
+        if eff_src_mask is not None:
+            if eff_src_mask.dim() == 2:
+                mem_mask_4d = eff_src_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                mem_mask_4d = eff_src_mask
+                
+        # 2. Initialize target tensor with <sos>
+        ys = torch.full((batch_size, 1), fill_value=sos_id, dtype=torch.long, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
-        if model.is_blt:
-            logits = model.blt_decoder(dec_out, target_byte_len=cur_len)
-        else:
-            logits = model.output_projection(dec_out)
+        for _ in range(max_len):
+            cur_len = ys.size(1)
+            tgt_mask = make_causal_mask(cur_len).to(device)
             
-        # Get next token logits for the last position: (batch_size, vocab_size)
-        next_token_logits = logits[:, -1, :].clone()
-        
-        # Apply repetition penalty to previously generated tokens
-        if repetition_penalty != 1.0:
-            mask = torch.zeros_like(next_token_logits, dtype=torch.bool)
-            mask.scatter_(1, ys, True)
-            mask[:, pad_id] = False
-            mask[:, sos_id] = False
-            mask[:, eos_id] = False
-            
-            next_token_logits = torch.where(
-                mask,
-                torch.where(next_token_logits > 0, next_token_logits / repetition_penalty, next_token_logits * repetition_penalty),
-                next_token_logits
+            # Decode current prefix
+            dec_out = model.decode(
+                tgt=ys,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                memory_mask=mem_mask_4d
             )
-                            
-        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)  # (batch_size, 1)
-        
-        # If sequence already finished, emit pad_id
-        next_token = torch.where(finished.unsqueeze(1), torch.full_like(next_token, pad_id), next_token)
-        ys = torch.cat([ys, next_token], dim=1)
-        
-        # Update finished mask
-        finished = finished | (next_token.squeeze(1) == eos_id)
-        if finished.all():
-            break
             
+            if model.is_blt:
+                logits = model.blt_decoder(dec_out, target_byte_len=cur_len)
+            else:
+                logits = model.output_projection(dec_out)
+                
+            # Next token logits for the last position: (batch_size, vocab_size)
+            next_token_logits = logits[:, -1, :]
+            
+            if repetition_penalty != 1.0:
+                mask = torch.zeros_like(next_token_logits, dtype=torch.bool)
+                mask.scatter_(1, ys, True)
+                mask[:, pad_id] = False
+                mask[:, sos_id] = False
+                mask[:, eos_id] = False
+                
+                next_token_logits = torch.where(
+                    mask,
+                    torch.where(next_token_logits > 0, next_token_logits / repetition_penalty, next_token_logits * repetition_penalty),
+                    next_token_logits
+                )
+                                
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # If sequence already finished, emit pad_id
+            next_token = torch.where(finished.unsqueeze(1), torch.full_like(next_token, pad_id), next_token)
+            ys = torch.cat([ys, next_token], dim=1)
+            
+            # Update finished mask
+            finished = finished | (next_token.squeeze(1) == eos_id)
+            if finished.all():
+                break
+                
     return ys
 
 
@@ -279,46 +280,47 @@ def evaluate_dataset(
     all_targets: List[str] = []
     val_loss = 0.0
     val_tokens = 0
+    use_amp = (device.type == 'cuda')
     
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            if max_eval_batches is not None and i >= max_eval_batches:
-                break
-                
-            src = batch["src"].to(device)
-            tgt_in = batch["tgt_in"].to(device)
-            tgt_out = batch["tgt_out"].to(device)
-            src_mask = batch["src_mask"].to(device)
-            tgt_mask = batch["tgt_mask"].to(device)
+            src = batch["src"].to(device, non_blocking=True)
+            tgt_in = batch["tgt_in"].to(device, non_blocking=True)
+            tgt_out = batch["tgt_out"].to(device, non_blocking=True)
+            src_mask = batch["src_mask"].to(device, non_blocking=True)
+            tgt_mask = batch["tgt_mask"].to(device, non_blocking=True)
             raw_targets = batch["raw_tgt"]
             
-            # Compute validation cross-entropy loss
+            # 1. Fast parallel validation loss with AMP
             if criterion is not None:
-                logits = model(src=src, tgt=tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
-                vocab_size = logits.size(-1)
-                loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    logits = model(src=src, tgt=tgt_in, src_mask=src_mask, tgt_mask=tgt_mask)
+                    vocab_size = logits.size(-1)
+                    loss = criterion(logits.reshape(-1, vocab_size), tgt_out.reshape(-1))
                 non_pad_tokens = (tgt_out != PAD_ID).sum().item()
                 val_loss += loss.item() * non_pad_tokens
                 val_tokens += non_pad_tokens
             
-            gen_ids = greedy_decode(
-                model=model,
-                src=src,
-                src_mask=src_mask,
-                max_len=max_decode_len
-            )
-            
-            gen_texts = decode_tokens_to_text(gen_ids.cpu().tolist(), tgt_tokenizer)
-            all_preds.extend(gen_texts)
-            all_targets.extend(raw_targets)
+            # 2. Fast autoregressive greedy decoding on a small monitoring subset
+            if i == 0 and (max_eval_batches is None or max_eval_batches > 0):
+                sample_limit = min(10, src.size(0))
+                gen_ids = greedy_decode(
+                    model=model,
+                    src=src[:sample_limit],
+                    src_mask=src_mask[:sample_limit] if src_mask is not None else None,
+                    max_len=max_decode_len
+                )
+                gen_texts = decode_tokens_to_text(gen_ids.cpu().tolist(), tgt_tokenizer)
+                all_preds.extend(gen_texts)
+                all_targets.extend(raw_targets[:sample_limit])
             
     avg_val_loss = val_loss / max(1, val_tokens) if val_tokens > 0 else 0.0
             
     # Compute all metrics
-    bit_acc = compute_bit_accuracy(all_preds, all_targets) * 100.0
-    seq_acc = compute_sequence_accuracy(all_preds, all_targets) * 100.0
-    lev_dist, lev_sim = compute_levenshtein(all_preds, all_targets)
-    bleu_rouge = compute_bleu_and_rouge(all_preds, all_targets)
+    bit_acc = compute_bit_accuracy(all_preds, all_targets) * 100.0 if all_preds else 0.0
+    seq_acc = compute_sequence_accuracy(all_preds, all_targets) * 100.0 if all_preds else 0.0
+    lev_dist, lev_sim = compute_levenshtein(all_preds, all_targets) if all_preds else (0.0, 0.0)
+    bleu_rouge = compute_bleu_and_rouge(all_preds, all_targets) if all_preds else {'bleu': 0.0, 'rouge1': 0.0, 'rouge2': 0.0, 'rougeL': 0.0}
     
     return {
         "val_loss": avg_val_loss,

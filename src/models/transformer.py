@@ -157,12 +157,10 @@ class TransformerDecoderLayer(nn.Module):
             self.norm1 = RMSNorm(d_model)
             self.norm2 = RMSNorm(d_model)
             self.norm3 = RMSNorm(d_model)
-            self.norm_mem = RMSNorm(d_model)
         else:
             self.norm1 = LayerNorm(d_model)
             self.norm2 = LayerNorm(d_model)
             self.norm3 = LayerNorm(d_model)
-            self.norm_mem = LayerNorm(d_model)
             
         # Self-Attention (Causal)
         if self.attention_type == 'gqa':
@@ -216,11 +214,10 @@ class TransformerDecoderLayer(nn.Module):
         
         # 2. Pre-LN Cross-Attention (Query = Decoder, Key/Value = Encoder Memory)
         norm_x = self.norm2(x)
-        norm_mem = self.norm_mem(memory)
         cross_out, _ = self.cross_attn(
             q=norm_x,
-            k=norm_mem,
-            v=norm_mem,
+            k=memory,
+            v=memory,
             mask=memory_mask,
             rotary_pos_emb=None  # RoPE relative indexing usually across self-attention sequences
         )
@@ -583,8 +580,7 @@ class Seq2SeqTransformer(nn.Module):
             # Add sinusoidal positional encoding on patch level
             src_emb = self.src_pos_enc(src_emb)
         else:
-            # Subword embedding scaled by sqrt(d_model) (standard Transformer)
-            src_emb = self.src_embedding(src) * math.sqrt(self.d_model)
+            src_emb = self.src_embedding(src)
             src_emb = self.src_pos_enc(src_emb)
             eff_mask = src_mask
 
@@ -621,7 +617,7 @@ class Seq2SeqTransformer(nn.Module):
         """
         batch_size, tgt_seq_len = tgt.shape
         
-        tgt_emb = self.tgt_embedding(tgt) * math.sqrt(self.d_model)
+        tgt_emb = self.tgt_embedding(tgt)
         tgt_emb = self.tgt_pos_enc(tgt_emb)
         
         rotary_pos = self.rope(tgt_seq_len, device=tgt.device) if self.use_rope else None

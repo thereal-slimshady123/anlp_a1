@@ -49,31 +49,17 @@ class ScaledDotProductAttention(nn.Module):
         """
         d_k = q.size(-1)
         
-        # Compute raw attention scores: (batch, heads, seq_len_q, seq_len_k)
-        # q @ k.transpose(-2, -1) performs batched matrix multiplication
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
         
-        # Apply mask if provided
         if mask is not None:
             if mask.dtype == torch.bool:
-                # If boolean mask, fill False positions with a very large negative number
-                # or fill True positions where mask is a masking condition
-                # Standard convention: True indicates valid token (keep), False indicates masked token
                 scores = scores.masked_fill(~mask, float('-inf'))
             else:
-                # Additive mask (e.g. causal mask with 0.0 and -inf)
                 scores = scores + mask
                 
-        # Softmax along the last dimension (over key sequence length)
         attn_weights = torch.softmax(scores, dim=-1)
-        
-        # Handle cases where an entire row is masked out (softmax produces NaNs)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-        
-        # Apply dropout to attention probabilities
         attn_weights_dropped = self.dropout(attn_weights)
-        
-        # Weighted sum of values: (batch, heads, seq_len_q, d_v)
         output = torch.matmul(attn_weights_dropped, v)
         
         return output, attn_weights
