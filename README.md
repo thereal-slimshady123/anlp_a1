@@ -10,14 +10,12 @@ An implementation of a custom Sequence-to-Sequence Transformer architecture buil
 2024111009_assignment1/
 ├── src/
 │   ├── models/
-│   │   ├── __init__.py        # Exports all low-level building blocks and model classes
 │   │   ├── attention.py       # Scaled Dot-Product, MultiHeadAttention (MHA), GroupedQueryAttention (GQA)
 │   │   ├── positional.py      # Sinusoidal Absolute Positional Encoding & Rotary Position Embedding (RoPE)
 │   │   ├── norm.py            # Custom LayerNorm & RMSNorm
-│   │   ├── blt.py             # Byte Latent Transformer (BLT) local encoder/decoder patch modules
-│   │   └── transformer.py     # Pre-LN Transformer blocks, Encoder, Decoder, & unified Seq2SeqTransformer
+│   │   └── blt.py             # Byte Latent Transformer (BLT) dynamic entropy patch modules
 │   ├── dataset.py             # Learned BPE tokenizers, byte-level dataset, dynamic padding & masking
-│   ├── train.py               # Pre-LN training loop, WandB tracking, HF checkpointing, plotting
+│   ├── train.py               # Complete Pre-LN Seq2Seq Architecture, training loop, WandB & HF tracking
 │   └── utils.py               # Metrics: Bit-Level Acc, Seq Exact Match, Levenshtein, BLEU, ROUGE
 ├── tests/
 │   └── test_modules.py        # Comprehensive unit tests for all custom modules and configurations

@@ -15,6 +15,7 @@ from typing import Optional, Any, Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import matplotlib.pyplot as plt
@@ -29,7 +30,18 @@ except Exception:
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.models.transformer import Seq2SeqTransformer
+from src.models.norm import LayerNorm, RMSNorm
+from src.models.positional import (
+    SinusoidalPositionalEncoding,
+    RotaryPositionEmbedding,
+    apply_rotary_pos_emb
+)
+from src.models.attention import (
+    ScaledDotProductAttention,
+    MultiHeadAttention,
+    GroupedQueryAttention
+)
+from src.models.blt import ByteLocalEncoder, ByteLocalDecoder
 from src.dataset import (
     get_dataloaders,
     PAD_ID,
@@ -42,6 +54,570 @@ from src.utils import evaluate_dataset
 # Enable TensorFloat-32 (TF32) matmuls for faster execution on Ampere/Lovelace GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+# =========================================================================
+#  Model Architecture Blocks (Pre-LN Transformer from Scratch)
+# =========================================================================
+
+class FeedForward(nn.Module):
+    """
+    Position-wise Feed-Forward Network (FFN).
+    FFN(x) = GELU(x W_1 + b_1) W_2 + b_2
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        dropout: float = 0.1,
+        activation: str = 'gelu'
+    ):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.act = F.gelu if activation.lower() == 'gelu' else F.relu
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.dropout(self.act(self.w1(x))))
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Pre-LayerNorm Transformer Encoder Layer.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        attention_type: str = 'mha',
+        num_kv_heads: Optional[int] = None,
+        norm_type: str = 'layernorm',
+        dropout: float = 0.1,
+        use_rope: bool = False
+    ):
+        super().__init__()
+        self.use_rope = use_rope
+        self.attention_type = attention_type.lower()
+        
+        # 1. Normalization layers (LayerNorm vs RMSNorm)
+        if norm_type.lower() == 'rmsnorm':
+            self.norm1 = RMSNorm(d_model)
+            self.norm2 = RMSNorm(d_model)
+        else:
+            self.norm1 = LayerNorm(d_model)
+            self.norm2 = LayerNorm(d_model)
+            
+        # 2. Self-Attention (MHA vs GQA)
+        if self.attention_type == 'gqa':
+            num_kv = num_kv_heads if num_kv_heads is not None else num_heads // 2
+            self.self_attn = GroupedQueryAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=num_kv,
+                dropout=dropout
+            )
+        else:
+            self.self_attn = MultiHeadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            
+        # 3. FeedForward
+        self.ffn = FeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rotary_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        norm_x = self.norm1(x)
+        attn_out, _ = self.self_attn(
+            q=norm_x,
+            k=norm_x,
+            v=norm_x,
+            mask=mask,
+            rotary_pos_emb=rotary_pos_emb if self.use_rope else None
+        )
+        x = x + self.dropout(attn_out)
+        
+        norm_x = self.norm2(x)
+        ffn_out = self.ffn(norm_x)
+        x = x + self.dropout(ffn_out)
+        
+        return x
+
+
+class TransformerDecoderLayer(nn.Module):
+    """
+    Pre-LayerNorm Transformer Decoder Layer.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        attention_type: str = 'mha',
+        num_kv_heads: Optional[int] = None,
+        norm_type: str = 'layernorm',
+        dropout: float = 0.1,
+        use_rope: bool = False
+    ):
+        super().__init__()
+        self.use_rope = use_rope
+        self.attention_type = attention_type.lower()
+        
+        # Normalization layers
+        if norm_type.lower() == 'rmsnorm':
+            self.norm1 = RMSNorm(d_model)
+            self.norm2 = RMSNorm(d_model)
+            self.norm3 = RMSNorm(d_model)
+        else:
+            self.norm1 = LayerNorm(d_model)
+            self.norm2 = LayerNorm(d_model)
+            self.norm3 = LayerNorm(d_model)
+            
+        # Self-Attention (Causal) & Cross-Attention
+        if self.attention_type == 'gqa':
+            num_kv = num_kv_heads if num_kv_heads is not None else num_heads // 2
+            self.self_attn = GroupedQueryAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=num_kv,
+                dropout=dropout
+            )
+            self.cross_attn = GroupedQueryAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_kv_heads=num_kv,
+                dropout=dropout
+            )
+        else:
+            self.self_attn = MultiHeadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            self.cross_attn = MultiHeadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            
+        self.ffn = FeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        rotary_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        norm_x = self.norm1(x)
+        self_out, _ = self.self_attn(
+            q=norm_x,
+            k=norm_x,
+            v=norm_x,
+            mask=tgt_mask,
+            rotary_pos_emb=rotary_pos_emb if self.use_rope else None
+        )
+        x = x + self.dropout(self_out)
+        
+        norm_x = self.norm2(x)
+        cross_out, _ = self.cross_attn(
+            q=norm_x,
+            k=memory,
+            v=memory,
+            mask=memory_mask,
+            rotary_pos_emb=None
+        )
+        x = x + self.dropout(cross_out)
+        
+        norm_x = self.norm3(x)
+        ffn_out = self.ffn(norm_x)
+        x = x + self.dropout(ffn_out)
+        
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    """
+    Transformer Encoder consisting of a stack of Pre-LN TransformerEncoderLayers.
+    """
+    def __init__(
+        self,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        attention_type: str = 'mha',
+        num_kv_heads: Optional[int] = None,
+        norm_type: str = 'layernorm',
+        dropout: float = 0.1,
+        use_rope: bool = False
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                attention_type=attention_type,
+                num_kv_heads=num_kv_heads,
+                norm_type=norm_type,
+                dropout=dropout,
+                use_rope=use_rope
+            )
+            for _ in range(num_layers)
+        ])
+        
+        if norm_type.lower() == 'rmsnorm':
+            self.final_norm = RMSNorm(d_model)
+        else:
+            self.final_norm = LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rotary_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, mask=mask, rotary_pos_emb=rotary_pos_emb)
+        return self.final_norm(x)
+
+
+class TransformerDecoder(nn.Module):
+    """
+    Transformer Decoder consisting of a stack of Pre-LN TransformerDecoderLayers.
+    """
+    def __init__(
+        self,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        attention_type: str = 'mha',
+        num_kv_heads: Optional[int] = None,
+        norm_type: str = 'layernorm',
+        dropout: float = 0.1,
+        use_rope: bool = False
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                attention_type=attention_type,
+                num_kv_heads=num_kv_heads,
+                norm_type=norm_type,
+                dropout=dropout,
+                use_rope=use_rope
+            )
+            for _ in range(num_layers)
+        ])
+        
+        if norm_type.lower() == 'rmsnorm':
+            self.final_norm = RMSNorm(d_model)
+        else:
+            self.final_norm = LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        rotary_pos_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(
+                x,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                rotary_pos_emb=rotary_pos_emb
+            )
+        return self.final_norm(x)
+
+
+class Seq2SeqTransformer(nn.Module):
+    """
+    Unified Sequence-to-Sequence Transformer Framework from Scratch.
+    Supports configurations C1, C2, C3, C4, and C5 (BLT).
+    """
+    def __init__(
+        self,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        d_model: int = 256,
+        num_heads: int = 8,
+        num_encoder_layers: int = 4,
+        num_decoder_layers: int = 4,
+        d_ff: int = 1024,
+        pos_encoding: str = 'sinusoidal',
+        attention_type: str = 'mha',
+        num_kv_heads: Optional[int] = None,
+        norm_type: str = 'layernorm',
+        is_blt: bool = False,
+        blt_min_patch_len: int = 2,
+        blt_max_patch_len: int = 8,
+        blt_entropy_threshold: float = 4.0,
+        blt_d_byte: int = 64,
+        max_len: int = 5000,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.src_vocab_size = src_vocab_size
+        self.tgt_vocab_size = tgt_vocab_size
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.pos_encoding = pos_encoding.lower()
+        self.attention_type = attention_type.lower()
+        self.norm_type = norm_type.lower()
+        self.is_blt = is_blt
+        self.blt_min_patch_len = blt_min_patch_len
+        self.blt_max_patch_len = blt_max_patch_len
+        self.blt_entropy_threshold = blt_entropy_threshold
+        self.max_len = max_len
+        self.d_k = d_model // num_heads
+
+        # 1. Token Embeddings / BLT Patch Modules
+        if self.is_blt:
+            self.src_encoder = ByteLocalEncoder(
+                vocab_size=src_vocab_size,
+                d_byte=blt_d_byte,
+                d_model=d_model,
+                min_patch_len=blt_min_patch_len,
+                max_patch_len=blt_max_patch_len,
+                entropy_threshold=blt_entropy_threshold,
+                dropout=dropout
+            )
+            self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model, padding_idx=0)
+            self.blt_decoder = ByteLocalDecoder(
+                vocab_size=tgt_vocab_size,
+                d_byte=blt_d_byte,
+                d_model=d_model,
+                dropout=dropout
+            )
+        else:
+            self.src_embedding = nn.Embedding(src_vocab_size, d_model, padding_idx=0)
+            self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model, padding_idx=0)
+            self.output_projection = nn.Linear(d_model, tgt_vocab_size)
+            
+        # 2. Positional Embeddings
+        self.use_rope = (self.pos_encoding == 'rope')
+        if self.pos_encoding == 'sinusoidal':
+            self.src_pos_enc = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+            self.tgt_pos_enc = SinusoidalPositionalEncoding(d_model=d_model, max_len=max_len, dropout=dropout)
+            self.rope = None
+        elif self.pos_encoding == 'rope':
+            self.src_pos_enc = nn.Dropout(dropout)
+            self.tgt_pos_enc = nn.Dropout(dropout)
+            self.rope = RotaryPositionEmbedding(d_head=self.d_k, max_len=max_len)
+        else:
+            raise ValueError(f"Unsupported pos_encoding: {pos_encoding}")
+            
+        # 3. Transformer Encoder Backbone
+        self.encoder = TransformerEncoder(
+            num_layers=num_encoder_layers,
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            attention_type=attention_type,
+            num_kv_heads=num_kv_heads,
+            norm_type=norm_type,
+            dropout=dropout,
+            use_rope=self.use_rope
+        )
+        
+        # 4. Transformer Decoder Backbone
+        self.decoder = TransformerDecoder(
+            num_layers=num_decoder_layers,
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            attention_type=attention_type,
+            num_kv_heads=num_kv_heads,
+            norm_type=norm_type,
+            dropout=dropout,
+            use_rope=self.use_rope
+        )
+
+    @classmethod
+    def from_config_name(
+        cls,
+        config_name: str,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        d_model: int = 256,
+        num_heads: int = 8,
+        num_encoder_layers: int = 4,
+        num_decoder_layers: int = 4,
+        d_ff: int = 1024,
+        **kwargs
+    ) -> 'Seq2SeqTransformer':
+        cfg = config_name.upper()
+        if cfg == 'C1':
+            return cls(
+                src_vocab_size=src_vocab_size,
+                tgt_vocab_size=tgt_vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_encoder_layers,
+                num_decoder_layers=num_decoder_layers,
+                d_ff=d_ff,
+                pos_encoding='sinusoidal',
+                attention_type='mha',
+                norm_type='layernorm',
+                is_blt=False,
+                **kwargs
+            )
+        elif cfg == 'C2':
+            return cls(
+                src_vocab_size=src_vocab_size,
+                tgt_vocab_size=tgt_vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_encoder_layers,
+                num_decoder_layers=num_decoder_layers,
+                d_ff=d_ff,
+                pos_encoding='rope',
+                attention_type='mha',
+                norm_type='layernorm',
+                is_blt=False,
+                **kwargs
+            )
+        elif cfg == 'C3':
+            num_kv = kwargs.pop('num_kv_heads', max(1, num_heads // 2))
+            return cls(
+                src_vocab_size=src_vocab_size,
+                tgt_vocab_size=tgt_vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_encoder_layers,
+                num_decoder_layers=num_decoder_layers,
+                d_ff=d_ff,
+                pos_encoding='sinusoidal',
+                attention_type='gqa',
+                num_kv_heads=num_kv,
+                norm_type='layernorm',
+                is_blt=False,
+                **kwargs
+            )
+        elif cfg == 'C4':
+            return cls(
+                src_vocab_size=src_vocab_size,
+                tgt_vocab_size=tgt_vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_encoder_layers,
+                num_decoder_layers=num_decoder_layers,
+                d_ff=d_ff,
+                pos_encoding='sinusoidal',
+                attention_type='mha',
+                norm_type='rmsnorm',
+                is_blt=False,
+                **kwargs
+            )
+        elif cfg == 'C5':
+            return cls(
+                src_vocab_size=src_vocab_size,
+                tgt_vocab_size=tgt_vocab_size,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_encoder_layers,
+                num_decoder_layers=num_decoder_layers,
+                d_ff=d_ff,
+                pos_encoding='sinusoidal',
+                attention_type='mha',
+                norm_type='layernorm',
+                is_blt=True,
+                **kwargs
+            )
+        else:
+            raise ValueError(f"Unknown config name: {config_name}. Must be one of C1, C2, C3, C4, C5.")
+
+    def encode(
+        self,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.is_blt:
+            src_emb, eff_mask = self.src_encoder(src, byte_mask=src_mask)
+            src_emb = self.src_pos_enc(src_emb)
+        else:
+            src_emb = self.src_embedding(src)
+            src_emb = self.src_pos_enc(src_emb)
+            eff_mask = src_mask
+
+        attn_mask = None
+        if eff_mask is not None:
+            if eff_mask.dim() == 2:
+                attn_mask = eff_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                attn_mask = eff_mask
+
+        rotary_pos = self.rope(src_emb.size(1), device=src.device) if self.use_rope else None
+        memory = self.encoder(src_emb, mask=attn_mask, rotary_pos_emb=rotary_pos)
+        return memory, eff_mask
+
+    def decode(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        batch_size, tgt_seq_len = tgt.shape
+        tgt_emb = self.tgt_embedding(tgt)
+        tgt_emb = self.tgt_pos_enc(tgt_emb)
+        rotary_pos = self.rope(tgt_seq_len, device=tgt.device) if self.use_rope else None
+        
+        dec_out = self.decoder(
+            tgt_emb,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            memory_mask=memory_mask,
+            rotary_pos_emb=rotary_pos
+        )
+        return dec_out
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        memory, eff_src_mask = self.encode(src, src_mask=src_mask)
+        mem_mask_4d = None
+        if eff_src_mask is not None:
+            if eff_src_mask.dim() == 2:
+                mem_mask_4d = eff_src_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                mem_mask_4d = eff_src_mask
+                
+        dec_out = self.decode(
+            tgt=tgt,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            memory_mask=mem_mask_4d
+        )
+        
+        if self.is_blt:
+            logits = self.blt_decoder(dec_out, target_byte_len=tgt.size(1))
+        else:
+            logits = self.output_projection(dec_out)
+            
+        return logits
 
 
 def set_seed(seed: int = 42):
@@ -347,9 +923,18 @@ def run_training(args):
         d_ff=args.d_ff,
         num_kv_heads=args.num_kv_heads,
         dropout=args.dropout,
-        blt_patch_size=args.blt_patch_size,
+        blt_min_patch_len=args.blt_min_patch_len,
+        blt_max_patch_len=args.blt_max_patch_len,
+        blt_entropy_threshold=args.blt_entropy_threshold,
         blt_d_byte=args.blt_d_byte
     ).to(device)
+
+    if args.config.upper() == 'C5' and hasattr(model, 'src_encoder') and hasattr(model.src_encoder, 'entropy_estimator'):
+        print("[BLT] Fitting empirical byte transition entropy estimator on training dataset...")
+        train_byte_seqs = [s["src"].tolist() for s in train_loader.dataset.samples]
+        model.src_encoder.entropy_estimator.fit_sequences(train_byte_seqs)
+        mean_ent = model.src_encoder.entropy_estimator.byte_entropy_table[4:260].mean().item()
+        print(f"[BLT] Dynamic entropy table fitted! Mean byte entropy: {mean_ent:.3f} bits (Threshold: {args.blt_entropy_threshold} bits)")
     
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[MODEL] Total Parameters: {total_params:,}")
@@ -534,7 +1119,9 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     
     # BLT Specific Hyperparameters (C5)
-    parser.add_argument("--blt_patch_size", type=int, default=4, help="Patch size for BLT local encoder/decoder")
+    parser.add_argument("--blt_min_patch_len", type=int, default=2, help="Minimum patch length (k_min) for dynamic BLT")
+    parser.add_argument("--blt_max_patch_len", type=int, default=8, help="Maximum patch length (k_max) for dynamic BLT")
+    parser.add_argument("--blt_entropy_threshold", type=float, default=4.0, help="Entropy threshold in bits for dynamic BLT boundary")
     parser.add_argument("--blt_d_byte", type=int, default=64, help="Byte embedding dimension for BLT")
     
     # Training Hyperparameters

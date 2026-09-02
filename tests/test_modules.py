@@ -222,52 +222,72 @@ class TestAttentionModules(unittest.TestCase):
 class TestBLTModules(unittest.TestCase):
     def setUp(self):
         self.batch_size = 2
-        self.byte_seq_len = 32  # e.g., 32 bytes
+        self.byte_seq_len = 32
         self.vocab_size = 260
         self.d_byte = 32
         self.d_model = 64
-        self.patch_size = 4
-        self.expected_num_patches = self.byte_seq_len // self.patch_size  # 8
+        self.min_patch_len = 2
+        self.max_patch_len = 8
+        self.entropy_threshold = 4.0
 
-    def test_byte_local_encoder_shape_and_mask(self):
+    def test_byte_entropy_estimator(self):
+        from src.models.blt import ByteEntropyEstimator
+        estimator = ByteEntropyEstimator(vocab_size=self.vocab_size)
+        
+        sample_seqs = [
+            [1, 4, 10, 20, 2],
+            [1, 4, 10, 30, 2],
+            [1, 5, 10, 20, 2]
+        ]
+        estimator.fit_sequences(sample_seqs)
+        
+        byte_ids = torch.tensor([[1, 4, 10, 20, 2]])
+        entropy = estimator(byte_ids)
+        self.assertEqual(entropy.shape, (1, 5))
+        # Entropy should be non-negative
+        self.assertTrue((entropy >= 0.0).all().item())
+
+    def test_byte_local_encoder_dynamic_patch_shapes(self):
         encoder = ByteLocalEncoder(
             vocab_size=self.vocab_size,
             d_byte=self.d_byte,
             d_model=self.d_model,
-            patch_size=self.patch_size
+            min_patch_len=self.min_patch_len,
+            max_patch_len=self.max_patch_len,
+            entropy_threshold=self.entropy_threshold
         )
         
-        byte_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.byte_seq_len))
+        byte_ids = torch.randint(4, self.vocab_size, (self.batch_size, self.byte_seq_len))
         byte_mask = torch.ones(self.batch_size, self.byte_seq_len, dtype=torch.bool)
-        # Mask out the last 8 bytes
-        byte_mask[:, -8:] = False
+        byte_mask[0, -8:] = False  # Mask out last 8 bytes for batch item 0
         
         patch_embeds, patch_mask = encoder(byte_ids, byte_mask)
         
-        # Check shape: (batch, num_patches, d_model)
-        self.assertEqual(patch_embeds.shape, (self.batch_size, self.expected_num_patches, self.d_model))
-        # Check patch mask shape: (batch, num_patches)
-        self.assertEqual(patch_mask.shape, (self.batch_size, self.expected_num_patches))
-        # Last 2 patches (8 bytes / 4) should be False
-        self.assertFalse(patch_mask[:, -2:].any().item())
-        self.assertTrue(patch_mask[:, :-2].all().item())
+        # Check that patch embeds are 3D: (batch, num_patches, d_model)
+        self.assertEqual(patch_embeds.dim(), 3)
+        self.assertEqual(patch_embeds.size(0), self.batch_size)
+        self.assertEqual(patch_embeds.size(2), self.d_model)
+        
+        # Check patch mask
+        self.assertEqual(patch_mask.shape, (self.batch_size, patch_embeds.size(1)))
+        self.assertTrue(patch_mask[0].any().item())
+        self.assertTrue(patch_mask[1].any().item())
 
     def test_byte_local_decoder_shape_and_grad(self):
         decoder = ByteLocalDecoder(
             vocab_size=self.vocab_size,
             d_byte=self.d_byte,
-            d_model=self.d_model,
-            patch_size=self.patch_size
+            d_model=self.d_model
         )
         
-        patch_latents = torch.randn(
+        tgt_latents = torch.randn(
             self.batch_size,
-            self.expected_num_patches,
+            self.byte_seq_len,
             self.d_model,
             requires_grad=True
         )
         
-        logits = decoder(patch_latents, target_byte_len=self.byte_seq_len)
+        logits = decoder(tgt_latents, target_byte_len=self.byte_seq_len)
         
         # Check shape: (batch, byte_seq_len, vocab_size)
         self.assertEqual(logits.shape, (self.batch_size, self.byte_seq_len, self.vocab_size))
@@ -275,7 +295,7 @@ class TestBLTModules(unittest.TestCase):
         # Test backward pass
         loss = logits.sum()
         loss.backward()
-        self.assertIsNotNone(patch_latents.grad)
+        self.assertIsNotNone(tgt_latents.grad)
         self.assertIsNotNone(decoder.lm_head.weight.grad)
 
     def test_blt_end_to_end_gradient_flow(self):
@@ -283,21 +303,24 @@ class TestBLTModules(unittest.TestCase):
             vocab_size=self.vocab_size,
             d_byte=self.d_byte,
             d_model=self.d_model,
-            patch_size=self.patch_size
+            min_patch_len=self.min_patch_len,
+            max_patch_len=self.max_patch_len
         )
         decoder = ByteLocalDecoder(
             vocab_size=self.vocab_size,
             d_byte=self.d_byte,
-            d_model=self.d_model,
-            patch_size=self.patch_size
+            d_model=self.d_model
         )
         
-        byte_ids = torch.randint(1, self.vocab_size, (self.batch_size, self.byte_seq_len))
+        byte_ids = torch.randint(4, self.vocab_size, (self.batch_size, self.byte_seq_len))
         patch_latents, _ = encoder(byte_ids)
-        logits = decoder(patch_latents, target_byte_len=self.byte_seq_len)
         
-        target = torch.randint(0, self.vocab_size, (self.batch_size, self.byte_seq_len))
-        loss = nn.CrossEntropyLoss()(logits.view(-1, self.vocab_size), target.view(-1))
+        # Suppose decoder operates on a target sequence
+        tgt_latents = torch.randn(self.batch_size, 16, self.d_model, requires_grad=True)
+        logits = decoder(tgt_latents)
+        
+        target = torch.randint(0, self.vocab_size, (self.batch_size, 16))
+        loss = nn.CrossEntropyLoss()(logits.view(-1, self.vocab_size), target.view(-1)) + patch_latents.sum()
         loss.backward()
         
         self.assertIsNotNone(encoder.byte_embedding.weight.grad)
@@ -318,7 +341,7 @@ class TestSeq2SeqTransformer(unittest.TestCase):
         self.d_ff = 128
 
     def _test_config_forward_backward(self, config_name: str, src_vocab: int, tgt_vocab: int):
-        from src.models.transformer import Seq2SeqTransformer
+        from src.train import Seq2SeqTransformer
         
         model = Seq2SeqTransformer.from_config_name(
             config_name=config_name,
